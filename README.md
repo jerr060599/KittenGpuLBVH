@@ -16,6 +16,8 @@ This is partly rewritten in reference to https://github.com/ToruNiina/lbvh for s
 
 On an RTX 3090, this implementation can build a tree of 100K objects in 200us. Refitting takes 40us. Querying takes 80us. This makes it a fast solution for when performance is needed on the GPU.
 
+Everything can be found in lbvh.cuh and lbvh.cu. 
+
 ## Interface
 The LBVH is written to be as easy to use and integrate as possible with minimal use of templates. 
 
