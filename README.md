@@ -66,5 +66,5 @@ for (size_t i = 0; i < res.size(); i++)
 ```
 
 That is it. 
-Compute can be called multiple times to reuse allocated memory. 
+Compute() can be called multiple times to reuse allocated memory. 
 In cases where a complete rebuild isnt needed, a simple refit() can ensure correctness with updated bounding boxes. 
