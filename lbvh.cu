@@ -338,7 +338,7 @@ namespace Kitten {
 			return b;
 		});
 
-		// Compute unique morton codes
+		// Compute morton codes. These don't have to be unique here.
 		LBVHKernels::mortonKernel<float> << <(numObjs + 255) / 256, 256 >> > (
 			devicePtr, thrust::raw_pointer_cast(d_morton.data()),
 			thrust::raw_pointer_cast(d_objIDs.data()), wholeAABB, numObjs);
