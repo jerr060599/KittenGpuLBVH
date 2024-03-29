@@ -36,7 +36,7 @@ namespace Kitten {
 
 		// Merges morton code with its index to output a sorted unique 64-bit key.
 		__device__ inline uint64_t mergeIdx(const uint32_t code, const int idx) {
-			return ((uint64_t)code << 32ul) | (uint64_t)idx;;
+			return ((uint64_t)code << 32ul) | (uint64_t)idx;
 		}
 
 		__device__ inline ivec2 determineRange(uint32_t const* mortonCodes,
