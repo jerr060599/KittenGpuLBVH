@@ -161,23 +161,38 @@ namespace Kitten {
 			const int tid = threadIdx.x + blockIdx.x * blockDim.x;
 			if (tid >= numObjs) return;
 
+			// Keep track of the maximum stack size required for DFS
+			// Assuming full exploration and always pushing the left child first.
+			int depth = 1;
+
 			int lastID = tid + numObjs - 1;
 			int parent = nodes[lastID].parentIdx;
 			Bound<3, float> last = aabbs[lastID];
 			while (true) {
 				// Exit if we are the first thread here
-				if (!atomicOr(flags + parent, 1))
-					return;
+				int otherDepth = atomicOr(flags + parent, depth);
+				if (!otherDepth) return;
 
 				LBVH::node node = nodes[parent];
-				int sibling = (node.leftIdx == lastID) ? node.rightIdx : node.leftIdx;
+				int sibling;
+				if (node.leftIdx == lastID) {					// We were the left child
+					sibling = node.rightIdx;
+					depth = glm::max(depth, otherDepth + 1);
+				}
+				else {											// We were the right child
+					sibling = node.leftIdx;
+					depth = glm::max(depth + 1, otherDepth);
+				}
 
 				// Ensure memory coherency before we read.
 				__threadfence();
 
 				last.absorb(aabbs[sibling]);
 				aabbs[parent] = last;
-				if (!parent) break;
+				if (!parent) {			// We've reached the root.
+					flags[0] = depth;	// Only the one lucky thread gets to finish up.
+					return;
+				}
 				lastID = parent;
 				parent = node.parentIdx;
 			}
@@ -185,11 +200,11 @@ namespace Kitten {
 
 		// We do 128 wide blocks which gets us 8KB of shared memory per block on compute 8.6. 
 		// Realistically, though, we are limited by the number of registers so we can overallocate shared memory.
-		constexpr int MAX_RES_PER_BLOCK = 11 * 128;
+		constexpr int MAX_RES_PER_BLOCK = 8 * 128;
 
 		// Query the LBVH for overlapping objects
 		// Overcomplicated because of shared memory buffering
-		template<bool IGNORE_SELF>
+		template<bool IGNORE_SELF, int STACK_SIZE>
 		__global__ void lbvhQueryKernel(ivec2* res, int* resCounter, int maxRes,
 			LBVH::node const* nodes, Bound<3, float> const* aabbs,
 			LBVH::node const* queryNodes, Bound<3, float> const* queryAabbs, const int numQueries) {
@@ -210,7 +225,7 @@ namespace Kitten {
 			if (threadIdx.x == 0)
 				sharedCounter = 0;
 
-			int stack[32];						// We only need 32 nodes for a 2^31 tree
+			int stack[STACK_SIZE];				// We only need 32 nodes for a 2^31 tree
 			int* stackPtr = stack;
 			*(stackPtr++) = 0;					// Push
 
@@ -288,6 +303,26 @@ namespace Kitten {
 				if (done) break;
 			}
 		}
+
+		// We are primarily limited by the number of registers, so we always call the kernel with just enough stack space.
+		// This gives another ~15% performance boost for queries.
+		template<bool IGNORE_SELF>
+		void launchQueryKernel(ivec2* res, int* resCounter, int maxRes,
+			LBVH::node const* nodes, Bound<3, float> const* aabbs,
+			LBVH::node const* queryNodes, Bound<3, float> const* queryAabbs, const int numQueries, int stackSize) {
+
+			// This is a bit ugly but we want to compile the kernel for all stack sizes.
+#define DISPATCH_QUERY(N) case N: lbvhQueryKernel<IGNORE_SELF, N> << <(numQueries + 127) / 128, 128 >> > (res, resCounter, maxRes, nodes, aabbs, queryNodes, queryAabbs, numQueries); break;
+			switch (stackSize) {
+			default:
+				DISPATCH_QUERY(32); DISPATCH_QUERY(31); DISPATCH_QUERY(30); DISPATCH_QUERY(29); DISPATCH_QUERY(28); DISPATCH_QUERY(27); DISPATCH_QUERY(26); DISPATCH_QUERY(25);
+				DISPATCH_QUERY(24); DISPATCH_QUERY(23); DISPATCH_QUERY(22); DISPATCH_QUERY(21); DISPATCH_QUERY(20); DISPATCH_QUERY(19); DISPATCH_QUERY(18); DISPATCH_QUERY(17);
+				DISPATCH_QUERY(16); DISPATCH_QUERY(15); DISPATCH_QUERY(14); DISPATCH_QUERY(13); DISPATCH_QUERY(12); DISPATCH_QUERY(11); DISPATCH_QUERY(10); DISPATCH_QUERY(9);
+				DISPATCH_QUERY(8); DISPATCH_QUERY(7); DISPATCH_QUERY(6); DISPATCH_QUERY(5); DISPATCH_QUERY(4); DISPATCH_QUERY(3); DISPATCH_QUERY(2); DISPATCH_QUERY(1);
+
+			}
+#undef DISPATCH_QUERY
+		}
 	}
 
 #pragma endregion
@@ -359,6 +394,8 @@ namespace Kitten {
 			thrust::raw_pointer_cast(d_morton.data()), numObjs);
 
 		refitNoCopy();
+		maxStackSize = d_flags[0];		// Save max depth for query invocation
+
 		checkCudaErrors(cudaGetLastError());
 	}
 
@@ -369,14 +406,14 @@ namespace Kitten {
 
 		// Query the LBVH
 		const int numQuery = other->numObjs;
-		LBVHKernels::lbvhQueryKernel<false> << <(numQuery + 127) / 128, 128 >> > (
+		LBVHKernels::launchQueryKernel<false>(
 			d_res, d_counter, resSize,
 			thrust::raw_pointer_cast(d_nodes.data()),
 			thrust::raw_pointer_cast(d_aabbs.data()),
 			thrust::raw_pointer_cast(other->d_nodes.data()) + other->numObjs - 1,
 			thrust::raw_pointer_cast(other->d_aabbs.data()) + other->numObjs - 1,
-			numQuery
-			);
+			numQuery, maxStackSize
+		);
 
 		checkCudaErrors(cudaGetLastError());
 		return std::min((size_t)d_flags[0], resSize);
@@ -389,14 +426,14 @@ namespace Kitten {
 
 		// Query the LBVH
 		const int numQuery = numObjs;
-		LBVHKernels::lbvhQueryKernel<true> << <(numQuery + 127) / 128, 128 >> > (
+		LBVHKernels::launchQueryKernel<true>(
 			d_res, d_counter, resSize,
 			thrust::raw_pointer_cast(d_nodes.data()),
 			thrust::raw_pointer_cast(d_aabbs.data()),
 			thrust::raw_pointer_cast(d_nodes.data()) + numObjs - 1,
 			thrust::raw_pointer_cast(d_aabbs.data()) + numObjs - 1,
-			numQuery
-			);
+			numQuery, maxStackSize
+		);
 
 		checkCudaErrors(cudaGetLastError());
 		return std::min((size_t)d_flags[0], resSize);
@@ -489,7 +526,7 @@ namespace Kitten {
 		// Check that all nodes are accessible from the root
 		std::vector<int> stack;
 		int numVisited = 0;
-		int maxDepth = 0;
+		int maxSize = 0;
 		stack.push_back(0);
 		while (stack.size()) {
 			int idx = stack.back();
@@ -500,10 +537,12 @@ namespace Kitten {
 				stack.push_back(node.leftIdx);
 				stack.push_back(node.rightIdx);
 			}
-			maxDepth = std::max(maxDepth, (int)stack.size());
+			maxSize = std::max(maxSize, (int)stack.size());
 		}
 		if (numVisited != numObjs * 2 - 1)
 			printf("Error: Not all nodes are accessible from the root. Only %d/%d nodes are found.\n", numVisited, 2 * numObjs - 1);
+		if (maxStackSize != maxSize)
+			printf("Error: Max stack size mismatch. Stored %d, found %d\n", maxStackSize, maxSize);
 
 		// Print all nodes. Useful for debugging
 		if (false)
@@ -522,7 +561,7 @@ namespace Kitten {
 		lbvhCheckAABBMerge(nodes, aabbs, 0);
 
 		printf("Num nodes: %d\n", nodes.size());
-		printf("Max depth: %d\n", maxDepth);
+		printf("Max stack size: %d\n", maxStackSize);
 		printf("LBVH self check complete.\n\n");
 	}
 

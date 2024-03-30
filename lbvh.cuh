@@ -38,6 +38,10 @@ namespace Kitten {
 		thrust::device_ptr<aabb> d_objs = nullptr;
 		size_t numObjs = 0;
 
+		// This is exactly how large a stack needs to be to traverse this tree.
+		// Used by query() to minimize register usage.
+		int maxStackSize = 1;
+
 		thrust::device_vector<int> d_flags;			// Flags used for updating the tree
 
 		thrust::device_vector<uint32_t> d_morton;	// Morton codes for each lead
