@@ -7,8 +7,8 @@
 #include <thrust/host_vector.h>
 #include <thrust/device_vector.h>
 
-#include "KittenEngine/includes/modules/Common.h"
-#include "KittenEngine/includes/modules/Bound.h"
+#include <KittenEngine/includes/modules/Common.h>
+#include <KittenEngine/includes/modules/Bound.h>
 
 namespace Kitten {
 	/// <summary>
