@@ -117,7 +117,7 @@ namespace Kitten {
 
 		// Builds out the internal nodes of the LBVH
 		__global__ void lbvhBuildInternalKernel(LBVH::node* nodes,
-			Bound<3, float>* aabbs, uint32_t const* mortonCodes, int numObjs) {
+			int* flags, uint32_t const* mortonCodes, int numObjs) {
 
 			const int tid = threadIdx.x + blockIdx.x * blockDim.x;
 			if (tid >= numObjs - 1) return;
@@ -138,20 +138,20 @@ namespace Kitten {
 			nodes[children.x].parentIdx = tid;
 			nodes[children.y].parentIdx = tid;
 
-			// Reset internal node aabb
-			aabbs[tid] = Bound<3, float>();
+			// Reset flags for mergeUpKernel
+			flags[tid] = 0;
 		}
 
 		// Copy over leaf node aabbs if they have changed
 		__global__ void copyAABBKernel(LBVH::node* leafNodes,
-			Bound<3, float>* aabbs, Bound<3, float>* objAABBs, int numObjs) {
+			Bound<3, float>* leafAABBs, Bound<3, float>* objAABBs, int* flags, int numObjs) {
 
 			const int tid = threadIdx.x + blockIdx.x * blockDim.x;
 			if (tid >= numObjs) return;
 
-			aabbs[tid + numObjs - 1] = objAABBs[leafNodes[tid].objIdx];
-			if (tid < numObjs - 1)		// Reset internal aabb because we need to refit after this
-				aabbs[tid] = Bound<3, float>();
+			leafAABBs[tid] = objAABBs[leafNodes[tid].objIdx];
+			if (tid < numObjs - 1)		// Reset internal flags because we need to refit after this
+				flags[tid] = 0;
 		}
 
 		// Refits the AABBs of the internal nodes
@@ -319,7 +319,6 @@ namespace Kitten {
 				DISPATCH_QUERY(24); DISPATCH_QUERY(23); DISPATCH_QUERY(22); DISPATCH_QUERY(21); DISPATCH_QUERY(20); DISPATCH_QUERY(19); DISPATCH_QUERY(18); DISPATCH_QUERY(17);
 				DISPATCH_QUERY(16); DISPATCH_QUERY(15); DISPATCH_QUERY(14); DISPATCH_QUERY(13); DISPATCH_QUERY(12); DISPATCH_QUERY(11); DISPATCH_QUERY(10); DISPATCH_QUERY(9);
 				DISPATCH_QUERY(8); DISPATCH_QUERY(7); DISPATCH_QUERY(6); DISPATCH_QUERY(5); DISPATCH_QUERY(4); DISPATCH_QUERY(3); DISPATCH_QUERY(2); DISPATCH_QUERY(1);
-
 			}
 #undef DISPATCH_QUERY
 		}
@@ -329,10 +328,6 @@ namespace Kitten {
 #pragma region LBVH
 
 	void LBVH::refitNoCopy() {
-		// Reset flags
-		d_flags.resize(numObjs - 1);
-		thrust::fill(d_flags.begin(), d_flags.end(), 0);
-
 		// Go through and merge all the aabbs up from the leaf nodes
 		LBVHKernels::mergeUpKernel << <(numObjs + 255) / 256, 256 >> > (
 			thrust::raw_pointer_cast(d_nodes.data()),
@@ -344,8 +339,9 @@ namespace Kitten {
 		// Copy over leaf node aabbs
 		LBVHKernels::copyAABBKernel << <(numObjs + 255) / 256, 256 >> > (
 			thrust::raw_pointer_cast(d_nodes.data()) + numObjs - 1,
-			thrust::raw_pointer_cast(d_aabbs.data()),
-			thrust::raw_pointer_cast(d_objs), numObjs);
+			thrust::raw_pointer_cast(d_aabbs.data()) + numObjs - 1,
+			thrust::raw_pointer_cast(d_objs),
+			thrust::raw_pointer_cast(d_flags.data()), numObjs);
 
 		refitNoCopy();
 		checkCudaErrors(cudaGetLastError());
@@ -362,6 +358,7 @@ namespace Kitten {
 		d_objIDs.resize(numObjs);
 		d_nodes.resize(numNodes);
 		d_aabbs.resize(numNodes);
+		d_flags.resize(numInternalNodes);
 
 		// Compute the bounding box for the whole scene so we can assign morton codes
 		aabb wholeAABB;
@@ -390,7 +387,7 @@ namespace Kitten {
 		// Build out the internal nodes
 		LBVHKernels::lbvhBuildInternalKernel << <(numInternalNodes + 255) / 256, 256 >> > (
 			thrust::raw_pointer_cast(d_nodes.data()),
-			thrust::raw_pointer_cast(d_aabbs.data()),
+			thrust::raw_pointer_cast(d_flags.data()),
 			thrust::raw_pointer_cast(d_morton.data()), numObjs);
 
 		refitNoCopy();

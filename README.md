@@ -14,7 +14,7 @@ depending on [thrust](https://thrust.github.io/) and [glm](https://github.com/g-
 ## Implementation
 This is partly rewritten/referenced from https://github.com/ToruNiina/lbvh to be much more optimized, simpler to use, and, importantly, bug free. It was written as a module of KittenEngine, a simulation framework I wrote for research. 
 
-On an RTX 3090, this implementation can build a tree of 100K objects in 200us. Refitting takes 70us. Querying takes 70us. This makes it a fast solution for when performance is needed on the GPU.
+On an RTX 3090, this implementation can build a tree of 100K objects in 150us. Refitting takes 70us. Querying takes 70us. This makes it a fast solution for when performance is needed on the GPU.
 
 Everything can be found in lbvh.cuh and lbvh.cu. 
 
