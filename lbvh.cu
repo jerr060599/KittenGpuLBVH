@@ -199,8 +199,8 @@ namespace Kitten {
 		}
 
 		// We do 128 wide blocks which gets us 8KB of shared memory per block on compute 8.6. 
-		// Realistically, though, we are limited by the number of registers so we can overallocate shared memory.
-		constexpr int MAX_RES_PER_BLOCK = 8 * 128;
+		// Ideally leave some left for L1 cache.
+		constexpr int MAX_RES_PER_BLOCK = 4 * 128;
 
 		// Query the LBVH for overlapping objects
 		// Overcomplicated because of shared memory buffering
