@@ -226,15 +226,15 @@ namespace Kitten {
 				sharedCounter = 0;
 
 			int stack[STACK_SIZE];				// We only need 32 nodes for a 2^31 tree
-			int stackPos = 0;
-			stack[stackPos++] = 0;				// Push
+			int* stackPtr = stack;
+			*(stackPtr++) = 0;					// Push
 
 			while (true) {
 				__syncthreads();
 
 				if (active)
-					while (stackPos) {
-						int nodeIdx = stack[--stackPos];	// Pop
+					while (stackPtr != stack) {
+						int nodeIdx = *(--stackPtr);	// Pop
 						auto node = nodes[nodeIdx];
 
 						if (node.isLeaf()) {
@@ -244,7 +244,7 @@ namespace Kitten {
 							int sIdx = atomicAdd(&sharedCounter, 1);
 							if (sIdx >= MAX_RES_PER_BLOCK) {
 								// We cannot sync here so we push the node back on the stack and wait
-								stack[stackPos++] = nodeIdx;
+								*(stackPtr++) = nodeIdx;
 								break;
 							}
 							sharedRes[sIdx] = ivec2(node.objIdx, objIdx);
@@ -257,11 +257,11 @@ namespace Kitten {
 							// Internal node
 							const Bound<3, float> leftAABB = aabbs[node.leftIdx];
 							if (leftAABB.intersects(queryAABB))
-								stack[stackPos++] = node.leftIdx;	// Push
+								*(stackPtr++) = node.leftIdx;	// Push
 
 							const Bound<3, float> rightAABB = aabbs[node.rightIdx];
 							if (rightAABB.intersects(queryAABB))
-								stack[stackPos++] = node.rightIdx;	// Push
+								*(stackPtr++) = node.rightIdx;	// Push
 						}
 					}
 
