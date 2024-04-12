@@ -21,7 +21,7 @@ namespace Kitten {
 	namespace LBVHKernels {
 		// Computes the morton codes for each AABB
 		template<typename T>
-		__global__ void mortonKernel(Bound<3, T>* aabbs, uint32_t* codes, int* ids, Bound<3, T> wholeAABB, int size) {
+		__global__ void mortonKernel(Bound<3, T>* aabbs, uint32_t* codes, uint32_t* ids, Bound<3, T> wholeAABB, int size) {
 			const int tid = threadIdx.x + blockIdx.x * blockDim.x;
 			if (tid >= size) return;
 			vec3 coord = wholeAABB.normCoord(aabbs[tid].center()) * 1024.f;
@@ -98,65 +98,45 @@ namespace Kitten {
 			return split;
 		}
 
-		// Builds out the leaf nodes and reorders the AABBs to match the leaf ordering
-		__global__ void lbvhBuildLeafKernel(LBVH::node* leafNodes,
-			Bound<3, float>* leafAABBs, Bound<3, float>* objAABBs,
-			int const* objIDs, int numObjs) {
-
-			const int tid = threadIdx.x + blockIdx.x * blockDim.x;
-			if (tid >= numObjs) return;
-
-			LBVH::node node;
-			node.objIdx = objIDs[tid];
-			leafAABBs[tid] = objAABBs[node.objIdx];
-
-			node.parentIdx = 0;
-			node.fence = -1;
-			leafNodes[tid] = node;
-		}
-
 		// Builds out the internal nodes of the LBVH
 		__global__ void lbvhBuildInternalKernel(LBVH::node* nodes,
-			int* flags, uint32_t const* mortonCodes, int numObjs) {
+			uint32_t* leafParents, uint32_t const* mortonCodes, uint32_t const* objIDs, int numObjs) {
 
 			const int tid = threadIdx.x + blockIdx.x * blockDim.x;
 			if (tid >= numObjs - 1) return;
 
-			const ivec2 range = determineRange(mortonCodes, numObjs, tid);
+			ivec2 range = determineRange(mortonCodes, numObjs, tid);
+			nodes[tid].fence = (tid == range.x) ? range.y : range.x;
+
 			const int gamma = findSplit(mortonCodes, range.x, range.y);
 
 			// Left and right children are neighbors to the split point
 			// Check if there are leaf nodes, which are indexed behind the (numObj - 1) internal nodes
-			ivec2 children(
-				(range.x == gamma) ? gamma + numObjs - 1 : gamma,
-				(range.y == gamma + 1) ? gamma + numObjs : gamma + 1
-			);
+			if (range.x == gamma) {
+				leafParents[gamma] = (uint32_t)tid;
+				range.x = gamma | 0x80000000;
+			}
+			else {
+				range.x = gamma;
+				nodes[range.x].parentIdx = (uint32_t)tid;
+			}
 
-			nodes[tid].leftIdx = children.x;
-			nodes[tid].rightIdx = children.y;
-			nodes[tid].fence = (tid == range.x) ? range.y : range.x;
-			nodes[children.x].parentIdx = tid;
-			nodes[children.y].parentIdx = tid;
+			if (range.y == gamma + 1) {
+				leafParents[gamma + 1] = (uint32_t)tid | 0x80000000;
+				range.y = (gamma + 1) | 0x80000000;
+			}
+			else {
+				range.y = gamma + 1;
+				nodes[range.y].parentIdx = (uint32_t)tid | 0x80000000;
+			}
 
-			// Reset flags for mergeUpKernel
-			flags[tid] = 0;
-		}
-
-		// Copy over leaf node aabbs if they have changed
-		__global__ void copyAABBKernel(LBVH::node* leafNodes,
-			Bound<3, float>* leafAABBs, Bound<3, float>* objAABBs, int* flags, int numObjs) {
-
-			const int tid = threadIdx.x + blockIdx.x * blockDim.x;
-			if (tid >= numObjs) return;
-
-			leafAABBs[tid] = objAABBs[leafNodes[tid].objIdx];
-			if (tid < numObjs - 1)		// Reset internal flags because we need to refit after this
-				flags[tid] = 0;
+			nodes[tid].leftIdx = range.x;
+			nodes[tid].rightIdx = range.y;
 		}
 
 		// Refits the AABBs of the internal nodes
-		__global__ void mergeUpKernel(LBVH::node* nodes, Bound<3, float>* aabbs,
-			int* flags, int numObjs) {
+		__global__ void mergeUpKernel(LBVH::node* nodes,
+			uint32_t* leafParents, Bound<3, float>* aabbs, uint32_t* objIDs, int* flags, int numObjs) {
 
 			const int tid = threadIdx.x + blockIdx.x * blockDim.x;
 			if (tid >= numObjs) return;
@@ -165,36 +145,32 @@ namespace Kitten {
 			// Assuming full exploration and always pushing the left child first.
 			int depth = 1;
 
-			int lastID = tid + numObjs - 1;
-			int parent = nodes[lastID].parentIdx;
-			Bound<3, float> last = aabbs[lastID];
+			Bound<3, float> last = aabbs[objIDs[tid]];
+			int parent = leafParents[tid];
+
 			while (true) {
+				int isRight = (parent & 0x80000000) != 0;
+				parent = parent & 0x7FFFFFFF;
+				nodes[parent].bounds[isRight] = last;
+
 				// Exit if we are the first thread here
 				int otherDepth = atomicOr(flags + parent, depth);
 				if (!otherDepth) return;
 
-				LBVH::node node = nodes[parent];
-				int sibling;
-				if (node.leftIdx == lastID) {					// We were the left child
-					sibling = node.rightIdx;
-					depth = glm::max(depth, otherDepth + 1);
-				}
-				else {											// We were the right child
-					sibling = node.leftIdx;
+				if (isRight)
 					depth = glm::max(depth + 1, otherDepth);
-				}
+				else
+					depth = glm::max(depth, otherDepth + 1);
 
 				// Ensure memory coherency before we read.
 				__threadfence();
 
-				last.absorb(aabbs[sibling]);
-				aabbs[parent] = last;
 				if (!parent) {			// We've reached the root.
 					flags[0] = depth;	// Only the one lucky thread gets to finish up.
 					return;
 				}
-				lastID = parent;
-				parent = node.parentIdx;
+				last.absorb(nodes[parent].bounds[1 - isRight]);
+				parent = nodes[parent].parentIdx;
 			}
 		}
 
@@ -206,8 +182,8 @@ namespace Kitten {
 		// Overcomplicated because of shared memory buffering
 		template<bool IGNORE_SELF, int STACK_SIZE>
 		__global__ void lbvhQueryKernel(ivec2* res, int* resCounter, int maxRes,
-			LBVH::node const* nodes, Bound<3, float> const* aabbs,
-			LBVH::node const* queryNodes, Bound<3, float> const* queryAabbs, const int numQueries) {
+			const LBVH::node* nodes, const uint32_t* objIDs,
+			const uint32_t* queryIDs, const Bound<3, float>* queryAABBs, const int numQueries) {
 
 			const int tid = threadIdx.x + blockIdx.x * blockDim.x;
 			bool active = tid < numQueries;
@@ -215,8 +191,8 @@ namespace Kitten {
 			Bound<3, float> queryAABB;
 			int objIdx;
 			if (active) {
-				queryAABB = queryAabbs[tid];
-				objIdx = queryNodes[tid].objIdx;
+				objIdx = queryIDs[tid];
+				queryAABB = queryAABBs[objIdx];
 			}
 
 			__shared__ ivec2 sharedRes[MAX_RES_PER_BLOCK];
@@ -225,8 +201,8 @@ namespace Kitten {
 			if (threadIdx.x == 0)
 				sharedCounter = 0;
 
-			int stack[STACK_SIZE];				// We only need 32 nodes for a 2^31 tree
-			int* stackPtr = stack;
+			uint32_t stack[STACK_SIZE];				// We only need 32 nodes for a 2^31 tree
+			uint32_t* stackPtr = stack;
 			*(stackPtr++) = 0;					// Push
 
 			while (true) {
@@ -234,33 +210,35 @@ namespace Kitten {
 
 				if (active)
 					while (stackPtr != stack) {
-						int nodeIdx = *(--stackPtr);	// Pop
-						auto node = nodes[nodeIdx];
+						uint32_t nodeIdx = *(--stackPtr);	// Pop
+						bool isLeaf = nodeIdx & 0x80000000;
+						nodeIdx = nodeIdx & 0x7FFFFFFF;
 
-						if (node.isLeaf()) {
+						if (isLeaf) {
 							if (IGNORE_SELF)
-								if (nodeIdx <= tid + numQueries - 1) continue;
+								if (nodeIdx <= tid) continue;
+
 							// Add to shared memory
 							int sIdx = atomicAdd(&sharedCounter, 1);
 							if (sIdx >= MAX_RES_PER_BLOCK) {
 								// We cannot sync here so we push the node back on the stack and wait
-								*(stackPtr++) = nodeIdx;
+								*(stackPtr++) = nodeIdx | 0x80000000;
 								break;
 							}
-							sharedRes[sIdx] = ivec2(node.objIdx, objIdx);
+							sharedRes[sIdx] = ivec2(objIDs[nodeIdx], objIdx);
 						}
 						else {
+							auto node = nodes[nodeIdx];
+
 							// Ignore duplicate and self intersections
 							if (IGNORE_SELF)
 								if (glm::max(nodeIdx, node.fence) <= tid) continue;
 
 							// Internal node
-							const Bound<3, float> leftAABB = aabbs[node.leftIdx];
-							if (leftAABB.intersects(queryAABB))
+							if (node.bounds[0].intersects(queryAABB))
 								*(stackPtr++) = node.leftIdx;	// Push
 
-							const Bound<3, float> rightAABB = aabbs[node.rightIdx];
-							if (rightAABB.intersects(queryAABB))
+							if (node.bounds[1].intersects(queryAABB))
 								*(stackPtr++) = node.rightIdx;	// Push
 						}
 					}
@@ -308,11 +286,11 @@ namespace Kitten {
 		// This gives another ~15% performance boost for queries.
 		template<bool IGNORE_SELF>
 		void launchQueryKernel(ivec2* res, int* resCounter, int maxRes,
-			LBVH::node const* nodes, Bound<3, float> const* aabbs,
-			LBVH::node const* queryNodes, Bound<3, float> const* queryAabbs, const int numQueries, int stackSize) {
+			const LBVH::node* nodes, const uint32_t* objIDs,
+			const uint32_t* queryIDs, const Bound<3, float>* queryAABBs, const int numQueries, int stackSize) {
 
 			// This is a bit ugly but we want to compile the kernel for all stack sizes.
-#define DISPATCH_QUERY(N) case N: lbvhQueryKernel<IGNORE_SELF, N> << <(numQueries + 127) / 128, 128 >> > (res, resCounter, maxRes, nodes, aabbs, queryNodes, queryAabbs, numQueries); break;
+#define DISPATCH_QUERY(N) case N: lbvhQueryKernel<IGNORE_SELF, N> << <(numQueries + 127) / 128, 128 >> > (res, resCounter, maxRes, nodes, objIDs, queryIDs, queryAABBs, numQueries); break;
 			switch (stackSize) {
 			default:
 				DISPATCH_QUERY(32); DISPATCH_QUERY(31); DISPATCH_QUERY(30); DISPATCH_QUERY(29); DISPATCH_QUERY(28); DISPATCH_QUERY(27); DISPATCH_QUERY(26); DISPATCH_QUERY(25);
@@ -327,23 +305,17 @@ namespace Kitten {
 #pragma endregion
 #pragma region LBVH
 
-	void LBVH::refitNoCopy() {
+	void LBVH::refit() {
+		cudaMemset(thrust::raw_pointer_cast(d_flags.data()), 0, sizeof(uint32_t) * (numObjs - 1));
+
 		// Go through and merge all the aabbs up from the leaf nodes
 		LBVHKernels::mergeUpKernel << <(numObjs + 255) / 256, 256 >> > (
 			thrust::raw_pointer_cast(d_nodes.data()),
-			thrust::raw_pointer_cast(d_aabbs.data()),
-			thrust::raw_pointer_cast(d_flags.data()), numObjs);
-	}
-
-	void LBVH::refit() {
-		// Copy over leaf node aabbs
-		LBVHKernels::copyAABBKernel << <(numObjs + 255) / 256, 256 >> > (
-			thrust::raw_pointer_cast(d_nodes.data()) + numObjs - 1,
-			thrust::raw_pointer_cast(d_aabbs.data()) + numObjs - 1,
+			thrust::raw_pointer_cast(d_leafParents.data()),
 			thrust::raw_pointer_cast(d_objs),
+			thrust::raw_pointer_cast(d_objIDs.data()),
 			thrust::raw_pointer_cast(d_flags.data()), numObjs);
 
-		refitNoCopy();
 		checkCudaErrors(cudaGetLastError());
 	}
 
@@ -356,8 +328,8 @@ namespace Kitten {
 
 		d_morton.resize(numObjs);
 		d_objIDs.resize(numObjs);
-		d_nodes.resize(numNodes);
-		d_aabbs.resize(numNodes);
+		d_leafParents.resize(numObjs);
+		d_nodes.resize(numInternalNodes);
 		d_flags.resize(numInternalNodes);
 
 		// Compute the bounding box for the whole scene so we can assign morton codes
@@ -378,22 +350,15 @@ namespace Kitten {
 		// Sort morton codes
 		thrust::stable_sort_by_key(d_morton.begin(), d_morton.end(), d_objIDs.begin());
 
-		// Build out the leaf nodes
-		LBVHKernels::lbvhBuildLeafKernel << <(numObjs + 255) / 256, 256 >> > (
-			thrust::raw_pointer_cast(d_nodes.data()) + numObjs - 1,
-			thrust::raw_pointer_cast(d_aabbs.data()) + numObjs - 1,
-			devicePtr, thrust::raw_pointer_cast(d_objIDs.data()), numObjs);
-
 		// Build out the internal nodes
 		LBVHKernels::lbvhBuildInternalKernel << <(numInternalNodes + 255) / 256, 256 >> > (
 			thrust::raw_pointer_cast(d_nodes.data()),
-			thrust::raw_pointer_cast(d_flags.data()),
-			thrust::raw_pointer_cast(d_morton.data()), numObjs);
+			thrust::raw_pointer_cast(d_leafParents.data()),
+			thrust::raw_pointer_cast(d_morton.data()),
+			thrust::raw_pointer_cast(d_objIDs.data()), numObjs);
 
-		refitNoCopy();
+		refit();
 		maxStackSize = d_flags[0];		// Save max depth for query invocation
-
-		checkCudaErrors(cudaGetLastError());
 	}
 
 	size_t LBVH::query(ivec2* d_res, size_t resSize, LBVH* other) const {
@@ -402,13 +367,13 @@ namespace Kitten {
 		cudaMemset(d_counter, 0, sizeof(int));
 
 		// Query the LBVH
-		const int numQuery = other->numObjs;
+		const int numQuery = numObjs;
 		LBVHKernels::launchQueryKernel<false>(
 			d_res, d_counter, resSize,
 			thrust::raw_pointer_cast(d_nodes.data()),
-			thrust::raw_pointer_cast(d_aabbs.data()),
-			thrust::raw_pointer_cast(other->d_nodes.data()) + other->numObjs - 1,
-			thrust::raw_pointer_cast(other->d_aabbs.data()) + other->numObjs - 1,
+			thrust::raw_pointer_cast(d_objIDs.data()),
+			thrust::raw_pointer_cast(other->d_objIDs.data()),
+			thrust::raw_pointer_cast(other->d_objs),
 			numQuery, maxStackSize
 		);
 
@@ -426,9 +391,9 @@ namespace Kitten {
 		LBVHKernels::launchQueryKernel<true>(
 			d_res, d_counter, resSize,
 			thrust::raw_pointer_cast(d_nodes.data()),
-			thrust::raw_pointer_cast(d_aabbs.data()),
-			thrust::raw_pointer_cast(d_nodes.data()) + numObjs - 1,
-			thrust::raw_pointer_cast(d_aabbs.data()) + numObjs - 1,
+			thrust::raw_pointer_cast(d_objIDs.data()),
+			thrust::raw_pointer_cast(d_objIDs.data()),
+			thrust::raw_pointer_cast(d_objs),
 			numQuery, maxStackSize
 		);
 
@@ -439,39 +404,44 @@ namespace Kitten {
 #pragma endregion
 #pragma region testing
 
-	Kitten::Bound<3, float> lbvhCheckAABBMerge(
-		thrust::host_vector<LBVH::node>& nodes,
-		thrust::host_vector<Kitten::Bound<3, float>>& aabbs,
-		int idx) {
-
-		auto aabb = aabbs[idx];
-		auto node = nodes[idx];
-		if (node.isLeaf()) return aabb;
-
-		auto left = lbvhCheckAABBMerge(nodes, aabbs, node.leftIdx);
-		auto right = lbvhCheckAABBMerge(nodes, aabbs, node.rightIdx);
-		left.absorb(right);
-
+	void testAABBMatch(Kitten::Bound<3, float>& a, Kitten::Bound<3, float>& b, int idx) {
 		// Check if they match
-		if (length2(left.min - aabb.min) > 1e-7f || length2(left.max - aabb.max) > 1e-7f) {
+		if (length2(a.min - b.min) > 1e-7f || length2(a.max - b.max) > 1e-7f) {
 			printf("Error: AABB mismatch node %d\n", idx);
 			printf("Expected:\n");
-			Kitten::print(left.min);
-			Kitten::print(left.max);
+			Kitten::print(a.min);
+			Kitten::print(a.max);
 			printf("Found:\n");
-			Kitten::print(aabb.min);
-			Kitten::print(aabb.max);
+			Kitten::print(b.min);
+			Kitten::print(b.max);
+		}
+	}
+
+	Kitten::Bound<3, float> lbvhCheckAABBMerge(
+		thrust::host_vector<LBVH::node>& nodes,
+		uint32_t idx) {
+		auto node = nodes[idx];
+		if (!(node.leftIdx >> 31)) {
+			auto o = lbvhCheckAABBMerge(nodes, node.leftIdx);
+			testAABBMatch(o, node.bounds[0], node.leftIdx & 0x7FFFFFFF);
+		}
+		if (!(node.rightIdx >> 31)) {
+			auto o = lbvhCheckAABBMerge(nodes, node.rightIdx);
+			testAABBMatch(o, node.bounds[1], node.rightIdx & 0x7FFFFFFF);
 		}
 
-		return left;
+		node.bounds[0].absorb(node.bounds[1]);
+		return node.bounds[0];
 	}
 
 	ivec2 lbvhCheckIndexMerge(
 		thrust::host_vector<LBVH::node>& nodes,
-		int idx, int numObjs) {
+		uint32_t idx, int numObjs) {
+		bool isLeaf = idx >> 31;
+		idx &= 0x7FFFFFFF;
 
+		if (isLeaf) return ivec2(idx);
 		auto node = nodes[idx];
-		if (node.isLeaf()) return ivec2(idx - numObjs + 1);
 		ivec2 range(idx, node.fence);
 		if (range.y < range.x) std::swap(range.x, range.y);
 
@@ -492,11 +462,11 @@ namespace Kitten {
 
 		// Get nodes
 		thrust::host_vector<node> nodes(d_nodes.begin(), d_nodes.end());
-		thrust::host_vector<aabb> aabbs(d_aabbs.begin(), d_aabbs.end());
-		thrust::host_vector<uint64_t> morton(d_morton.begin(), d_morton.end());
+		thrust::host_vector<uint32_t> morton(d_morton.begin(), d_morton.end());
+		thrust::host_vector<uint32_t> leafParent(d_leafParents.begin(), d_leafParents.end());
 
 		// Check sizes
-		if (nodes.size() != numObjs * 2 - 1 || aabbs.size() != numObjs * 2 - 1 || morton.size() != numObjs)
+		if (nodes.size() != numObjs - 1 || morton.size() != numObjs)
 			printf("Error: Incorrect memory sizes\n");
 
 		// Check morton codes
@@ -504,36 +474,41 @@ namespace Kitten {
 			if (morton[i - 1] > morton[i])
 				printf("Bad morton code ordering\n");
 
-		// Check leaf nodes
-		for (size_t i = 0; i < numObjs; i++) {
-			auto node = nodes[i + numObjs - 1];
-			if (!node.isLeaf())
-				printf("Error: Leaf node is not a leaf\n");
-		}
-
 		// Check that all children have the correct parent
-		for (size_t i = 0; i < numObjs - 1; i++) {
+		for (size_t i = 1; i < numObjs - 1; i++) {
 			auto node = nodes[i];
-			if (node.isLeaf())
-				printf("Error: Internal node is a leaf\n");
-			if (nodes[node.leftIdx].parentIdx != i || nodes[node.rightIdx].parentIdx != i)
+			uint32_t isRight = node.parentIdx >> 31;
+			uint32_t parentIdx = node.parentIdx & 0x7FFFFFFF;
+			auto parent = nodes[parentIdx];
+
+			if ((isRight ? parent.rightIdx : parent.leftIdx) != i)
 				printf("Error: Child node has incorrect parent\n");
 		}
 
+		for (size_t i = 0; i < numObjs; i++) {
+			uint32_t parentIdx = leafParent[i];
+			uint32_t isRight = parentIdx >> 31;
+			parentIdx &= 0x7FFFFFFF;
+			auto parent = nodes[parentIdx];
+
+			if ((isRight ? parent.rightIdx : parent.leftIdx) != (i | 0x80000000))
+				printf("Error: Leaf node has incorrect parent\n");
+		}
+
 		// Check that all nodes are accessible from the root
-		std::vector<int> stack;
+		std::vector<uint32_t> stack;
 		int numVisited = 0;
 		int maxSize = 0;
 		stack.push_back(0);
 		while (stack.size()) {
-			int idx = stack.back();
+			auto idx = stack.back();
 			stack.pop_back();
 			numVisited++;
+			if (idx >> 31) continue;
+			idx &= 0x7FFFFFFF;
 			auto node = nodes[idx];
-			if (!node.isLeaf()) {
-				stack.push_back(node.leftIdx);
-				stack.push_back(node.rightIdx);
-			}
+			stack.push_back(node.leftIdx);
+			stack.push_back(node.rightIdx);
 			maxSize = std::max(maxSize, (int)stack.size());
 		}
 		if (numVisited != numObjs * 2 - 1)
@@ -541,24 +516,13 @@ namespace Kitten {
 		if (maxStackSize != maxSize)
 			printf("Error: Max stack size mismatch. Stored %d, found %d\n", maxStackSize, maxSize);
 
-		// Print all nodes. Useful for debugging
-		if (false)
-			for (size_t i = 0; i < nodes.size(); i++) {
-				printf("\n--node %d--\n", i);
-				printf("parent: %d\n", nodes[i].parentIdx);
-				printf("left: %d\n", nodes[i].leftIdx);
-				printf("right: %d\n", nodes[i].rightIdx);
-				printf("fence: %d\n", nodes[i].fence);
-				Kitten::print(aabbs[i].min);
-				Kitten::print(aabbs[i].max);
-			}
-
 		// Check merging of indices and aabbs
 		lbvhCheckIndexMerge(nodes, 0, numObjs);
-		lbvhCheckAABBMerge(nodes, aabbs, 0);
+		lbvhCheckAABBMerge(nodes, 0u);
 
-		printf("Num nodes: %d\n", nodes.size());
+		// printf("Num nodes: %d\n", nodes.size());
 		printf("Max stack size: %d\n", maxStackSize);
+		printf("Node size: %d\n", sizeof(LBVH::node));
 		printf("LBVH self check complete.\n\n");
 	}
 

@@ -20,18 +20,14 @@ namespace Kitten {
 		typedef Bound<3, float> aabb;
 		typedef glm::vec3 vec_type;
 
-		struct node {
-			uint32_t parentIdx;		// Parent node
-			union {
-				int leftIdx;	// Index of left child node.
-				int objIdx;		// Index of the aabb in the original data array
-			};
-			int rightIdx;		// Index of right child node.
-			int fence;			// This subtree have indices between fence and current index. Negative if leaf
+		// 64 byte node struct. Can fit two in a 128 byte cache line.
+		struct alignas(64) node {
+			uint32_t parentIdx;			// Parent node. Most siginificant bit is used to indicate whether this is a left or right child of said parent.
+			uint32_t leftIdx;			// Index of left child node. Most siginificant bit is used to indicate whether this is a leaf node.
+			uint32_t rightIdx;			// Index of right child node. Most siginificant bit is used to indicate whether this is a leaf node.
+			uint32_t fence;				// This subtree have indices between fence and current index.
 
-			__device__ __host__ bool isLeaf() const {
-				return fence < 0;
-			}
+			aabb bounds[2];
 		};
 
 	private:
@@ -42,15 +38,12 @@ namespace Kitten {
 		// Used by query() to minimize register usage.
 		int maxStackSize = 1;
 
-		thrust::device_vector<int> d_flags;			// Flags used for updating the tree
+		thrust::device_vector<int> d_flags;				// Flags used for updating the tree
 
-		thrust::device_vector<uint32_t> d_morton;	// Morton codes for each lead
-		thrust::device_vector<int> d_objIDs;		// Object ID for each leaf
-		thrust::device_vector<node> d_nodes;		// The internal tree nodes
-		thrust::device_vector<aabb> d_aabbs;		// AABB of each node
-
-		// Performs a refit without updating the d_aabbs array
-		void refitNoCopy();
+		thrust::device_vector<uint32_t> d_morton;		// Morton codes for each lead
+		thrust::device_vector<uint32_t> d_objIDs;		// Object ID for each leaf
+		thrust::device_vector<uint32_t> d_leafParents;	// Parent ID for each leaf
+		thrust::device_vector<node> d_nodes;			// The internal tree nodes
 
 	public:
 		/// <summary>
