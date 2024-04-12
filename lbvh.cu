@@ -201,7 +201,7 @@ namespace Kitten {
 			if (threadIdx.x == 0)
 				sharedCounter = 0;
 
-			uint32_t stack[STACK_SIZE];				// We only need 32 nodes for a 2^31 tree
+			uint32_t stack[STACK_SIZE];			// This is dynamically sized through templating
 			uint32_t* stackPtr = stack;
 			*(stackPtr++) = 0;					// Push
 

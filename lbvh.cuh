@@ -22,9 +22,9 @@ namespace Kitten {
 
 		// 64 byte node struct. Can fit two in a 128 byte cache line.
 		struct alignas(64) node {
-			uint32_t parentIdx;			// Parent node. Most siginificant bit is used to indicate whether this is a left or right child of said parent.
-			uint32_t leftIdx;			// Index of left child node. Most siginificant bit is used to indicate whether this is a leaf node.
-			uint32_t rightIdx;			// Index of right child node. Most siginificant bit is used to indicate whether this is a leaf node.
+			uint32_t parentIdx;			// Parent node. Most siginificant bit (MSB) is used to indicate whether this is a left or right child of said parent.
+			uint32_t leftIdx;			// Index of left child node. MSB is used to indicate whether this is a leaf node.
+			uint32_t rightIdx;			// Index of right child node. MSB is used to indicate whether this is a leaf node.
 			uint32_t fence;				// This subtree have indices between fence and current index.
 
 			aabb bounds[2];
@@ -40,9 +40,9 @@ namespace Kitten {
 
 		thrust::device_vector<int> d_flags;				// Flags used for updating the tree
 
-		thrust::device_vector<uint32_t> d_morton;		// Morton codes for each lead
+		thrust::device_vector<uint32_t> d_morton;		// Morton codes for each object
 		thrust::device_vector<uint32_t> d_objIDs;		// Object ID for each leaf
-		thrust::device_vector<uint32_t> d_leafParents;	// Parent ID for each leaf
+		thrust::device_vector<uint32_t> d_leafParents;	// Parent ID for each leaf. MSB is used to indicate whether this is a left or right child of said parent.
 		thrust::device_vector<node> d_nodes;			// The internal tree nodes
 
 	public:
