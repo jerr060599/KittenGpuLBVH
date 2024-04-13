@@ -304,6 +304,9 @@ namespace Kitten {
 
 #pragma endregion
 #pragma region LBVH
+	LBVH::aabb LBVH::bounds() {
+		return rootBounds;
+	}
 
 	void LBVH::refit() {
 		cudaMemset(thrust::raw_pointer_cast(d_flags.data()), 0, sizeof(uint32_t) * (numObjs - 1));
@@ -333,9 +336,9 @@ namespace Kitten {
 		d_flags.resize(numInternalNodes);
 
 		// Compute the bounding box for the whole scene so we can assign morton codes
-		aabb wholeAABB;
-		wholeAABB = thrust::reduce(
-			d_objs, d_objs + numObjs, wholeAABB,
+		rootBounds = aabb();
+		rootBounds = thrust::reduce(
+			d_objs, d_objs + numObjs, rootBounds,
 			[] __host__ __device__(const aabb & lhs, const aabb & rhs) {
 			auto b = lhs;
 			b.absorb(rhs);
@@ -345,7 +348,7 @@ namespace Kitten {
 		// Compute morton codes. These don't have to be unique here.
 		LBVHKernels::mortonKernel<float> << <(numObjs + 255) / 256, 256 >> > (
 			devicePtr, thrust::raw_pointer_cast(d_morton.data()),
-			thrust::raw_pointer_cast(d_objIDs.data()), wholeAABB, numObjs);
+			thrust::raw_pointer_cast(d_objIDs.data()), rootBounds, numObjs);
 
 		// Sort morton codes
 		thrust::stable_sort_by_key(d_morton.begin(), d_morton.end(), d_objIDs.begin());
@@ -404,7 +407,7 @@ namespace Kitten {
 #pragma endregion
 #pragma region testing
 
-	void testAABBMatch(Kitten::Bound<3, float>& a, Kitten::Bound<3, float>& b, int idx) {
+	void testAABBMatch(Kitten::Bound<3, float> a, Kitten::Bound<3, float> b, int idx) {
 		// Check if they match
 		if (length2(a.min - b.min) > 1e-7f || length2(a.max - b.max) > 1e-7f) {
 			printf("Error: AABB mismatch node %d\n", idx);
@@ -518,7 +521,7 @@ namespace Kitten {
 
 		// Check merging of indices and aabbs
 		lbvhCheckIndexMerge(nodes, 0, numObjs);
-		lbvhCheckAABBMerge(nodes, 0u);
+		testAABBMatch(lbvhCheckAABBMerge(nodes, 0u), rootBounds, 0);
 
 		// printf("Num nodes: %d\n", nodes.size());
 		printf("Max stack size: %d\n", maxStackSize);

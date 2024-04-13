@@ -33,6 +33,7 @@ namespace Kitten {
 	private:
 		thrust::device_ptr<aabb> d_objs = nullptr;
 		size_t numObjs = 0;
+		aabb rootBounds;
 
 		// This is exactly how large a stack needs to be to traverse this tree.
 		// Used by query() to minimize register usage.
@@ -46,6 +47,9 @@ namespace Kitten {
 		thrust::device_vector<node> d_nodes;			// The internal tree nodes
 
 	public:
+		// Returns the total bounds of every node in this tree.
+		aabb bounds();
+
 		/// <summary>
 		/// Refits an existing aabb tree once compute() has been called.
 		/// Does not recompute the tree structure but only the AABBs.
