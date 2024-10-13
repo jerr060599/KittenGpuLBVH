@@ -41,6 +41,7 @@ namespace Kitten {
 
 	public:
 		LBVH();
+		~LBVH();
 
 		// Returns the total bounds of every node in this tree.
 		aabb bounds();

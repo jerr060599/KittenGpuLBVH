@@ -317,6 +317,7 @@ namespace Kitten {
 #pragma endregion
 #pragma region LBVH
 	LBVH::LBVH() : impl(std::make_unique<thrustImpl>()) {}
+	Kitten::LBVH::~LBVH() = default;
 
 	LBVH::aabb LBVH::bounds() {
 		return rootBounds;
