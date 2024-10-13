@@ -4,9 +4,7 @@
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
 
-#include <thrust/host_vector.h>
-#include <thrust/device_vector.h>
-
+#include <memory>
 #include <KittenEngine/includes/modules/Common.h>
 #include <KittenEngine/includes/modules/Bound.h>
 
@@ -31,7 +29,9 @@ namespace Kitten {
 		};
 
 	private:
-		thrust::device_ptr<aabb> d_objs = nullptr;
+		struct thrustImpl;
+		std::unique_ptr<thrustImpl> impl;
+
 		size_t numObjs = 0;
 		aabb rootBounds;
 
@@ -39,14 +39,9 @@ namespace Kitten {
 		// Used by query() to minimize register usage.
 		int maxStackSize = 1;
 
-		thrust::device_vector<int> d_flags;				// Flags used for updating the tree
-
-		thrust::device_vector<uint32_t> d_morton;		// Morton codes for each object
-		thrust::device_vector<uint32_t> d_objIDs;		// Object ID for each leaf
-		thrust::device_vector<uint32_t> d_leafParents;	// Parent ID for each leaf. MSB is used to indicate whether this is a left or right child of said parent.
-		thrust::device_vector<node> d_nodes;			// The internal tree nodes
-
 	public:
+		LBVH();
+
 		// Returns the total bounds of every node in this tree.
 		aabb bounds();
 

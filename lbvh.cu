@@ -3,6 +3,8 @@
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
 
+#include <thrust/host_vector.h>
+#include <thrust/device_vector.h>
 #include <thrust/swap.h>
 #include <thrust/host_vector.h>
 #include <thrust/device_vector.h>
@@ -15,6 +17,16 @@
 #include <unordered_set>
 
 namespace Kitten {
+
+	struct LBVH::thrustImpl {
+		thrust::device_ptr<aabb> d_objs = nullptr;
+		thrust::device_vector<int> d_flags;				// Flags used for updating the tree
+
+		thrust::device_vector<uint32_t> d_morton;		// Morton codes for each object
+		thrust::device_vector<uint32_t> d_objIDs;		// Object ID for each leaf
+		thrust::device_vector<uint32_t> d_leafParents;	// Parent ID for each leaf. MSB is used to indicate whether this is a left or right child of said parent.
+		thrust::device_vector<node> d_nodes;			// The internal tree nodes
+	};
 
 #pragma region LBVHDevice
 
@@ -304,41 +316,43 @@ namespace Kitten {
 
 #pragma endregion
 #pragma region LBVH
+	LBVH::LBVH() : impl(std::make_unique<thrustImpl>()) {}
+
 	LBVH::aabb LBVH::bounds() {
 		return rootBounds;
 	}
 
 	void LBVH::refit() {
-		cudaMemset(thrust::raw_pointer_cast(d_flags.data()), 0, sizeof(uint32_t) * (numObjs - 1));
+		cudaMemset(thrust::raw_pointer_cast(impl->d_flags.data()), 0, sizeof(uint32_t) * (numObjs - 1));
 
 		// Go through and merge all the aabbs up from the leaf nodes
 		LBVHKernels::mergeUpKernel << <(numObjs + 255) / 256, 256 >> > (
-			thrust::raw_pointer_cast(d_nodes.data()),
-			thrust::raw_pointer_cast(d_leafParents.data()),
-			thrust::raw_pointer_cast(d_objs),
-			thrust::raw_pointer_cast(d_objIDs.data()),
-			thrust::raw_pointer_cast(d_flags.data()), numObjs);
+			thrust::raw_pointer_cast(impl->d_nodes.data()),
+			thrust::raw_pointer_cast(impl->d_leafParents.data()),
+			thrust::raw_pointer_cast(impl->d_objs),
+			thrust::raw_pointer_cast(impl->d_objIDs.data()),
+			thrust::raw_pointer_cast(impl->d_flags.data()), numObjs);
 
 		checkCudaErrors(cudaGetLastError());
 	}
 
 	void LBVH::compute(aabb* devicePtr, size_t size) {
-		d_objs = thrust::device_ptr<aabb>(devicePtr);
+		impl->d_objs = thrust::device_ptr<aabb>(devicePtr);
 		numObjs = size;
 
 		const unsigned int numInternalNodes = numObjs - 1;	// Total number of internal nodes
 		const unsigned int numNodes = numObjs * 2 - 1;		// Total number of nodes
 
-		d_morton.resize(numObjs);
-		d_objIDs.resize(numObjs);
-		d_leafParents.resize(numObjs);
-		d_nodes.resize(numInternalNodes);
-		d_flags.resize(numInternalNodes);
+		impl->d_morton.resize(numObjs);
+		impl->d_objIDs.resize(numObjs);
+		impl->d_leafParents.resize(numObjs);
+		impl->d_nodes.resize(numInternalNodes);
+		impl->d_flags.resize(numInternalNodes);
 
 		// Compute the bounding box for the whole scene so we can assign morton codes
 		rootBounds = aabb();
 		rootBounds = thrust::reduce(
-			d_objs, d_objs + numObjs, rootBounds,
+			impl->d_objs, impl->d_objs + numObjs, rootBounds,
 			[] __host__ __device__(const aabb & lhs, const aabb & rhs) {
 			auto b = lhs;
 			b.absorb(rhs);
@@ -347,61 +361,61 @@ namespace Kitten {
 
 		// Compute morton codes. These don't have to be unique here.
 		LBVHKernels::mortonKernel<float> << <(numObjs + 255) / 256, 256 >> > (
-			devicePtr, thrust::raw_pointer_cast(d_morton.data()),
-			thrust::raw_pointer_cast(d_objIDs.data()), rootBounds, numObjs);
+			devicePtr, thrust::raw_pointer_cast(impl->d_morton.data()),
+			thrust::raw_pointer_cast(impl->d_objIDs.data()), rootBounds, numObjs);
 
 		// Sort morton codes
-		thrust::stable_sort_by_key(d_morton.begin(), d_morton.end(), d_objIDs.begin());
+		thrust::stable_sort_by_key(impl->d_morton.begin(), impl->d_morton.end(), impl->d_objIDs.begin());
 
 		// Build out the internal nodes
 		LBVHKernels::lbvhBuildInternalKernel << <(numInternalNodes + 255) / 256, 256 >> > (
-			thrust::raw_pointer_cast(d_nodes.data()),
-			thrust::raw_pointer_cast(d_leafParents.data()),
-			thrust::raw_pointer_cast(d_morton.data()),
-			thrust::raw_pointer_cast(d_objIDs.data()), numObjs);
+			thrust::raw_pointer_cast(impl->d_nodes.data()),
+			thrust::raw_pointer_cast(impl->d_leafParents.data()),
+			thrust::raw_pointer_cast(impl->d_morton.data()),
+			thrust::raw_pointer_cast(impl->d_objIDs.data()), numObjs);
 
 		refit();
-		maxStackSize = d_flags[0];		// Save max depth for query invocation
+		maxStackSize = impl->d_flags[0];		// Save max depth for query invocation
 	}
 
 	size_t LBVH::query(ivec2* d_res, size_t resSize, LBVH* other) const {
 		// Borrow the flags array for the counter
-		int* d_counter = (int*)thrust::raw_pointer_cast(d_flags.data());
+		int* d_counter = (int*)thrust::raw_pointer_cast(impl->d_flags.data());
 		cudaMemset(d_counter, 0, sizeof(int));
 
 		// Query the LBVH
 		const int numQuery = numObjs;
 		LBVHKernels::launchQueryKernel<false>(
 			d_res, d_counter, resSize,
-			thrust::raw_pointer_cast(d_nodes.data()),
-			thrust::raw_pointer_cast(d_objIDs.data()),
-			thrust::raw_pointer_cast(other->d_objIDs.data()),
-			thrust::raw_pointer_cast(other->d_objs),
+			thrust::raw_pointer_cast(impl->d_nodes.data()),
+			thrust::raw_pointer_cast(impl->d_objIDs.data()),
+			thrust::raw_pointer_cast(other->impl->d_objIDs.data()),
+			thrust::raw_pointer_cast(other->impl->d_objs),
 			numQuery, maxStackSize
 		);
 
 		checkCudaErrors(cudaGetLastError());
-		return std::min((size_t)d_flags[0], resSize);
+		return std::min((size_t)impl->d_flags[0], resSize);
 	}
 
 	size_t LBVH::query(ivec2* d_res, size_t resSize) const {
 		// Borrow the flags array for the counter
-		int* d_counter = (int*)thrust::raw_pointer_cast(d_flags.data());
+		int* d_counter = (int*)thrust::raw_pointer_cast(impl->d_flags.data());
 		cudaMemset(d_counter, 0, sizeof(int));
 
 		// Query the LBVH
 		const int numQuery = numObjs;
 		LBVHKernels::launchQueryKernel<true>(
 			d_res, d_counter, resSize,
-			thrust::raw_pointer_cast(d_nodes.data()),
-			thrust::raw_pointer_cast(d_objIDs.data()),
-			thrust::raw_pointer_cast(d_objIDs.data()),
-			thrust::raw_pointer_cast(d_objs),
+			thrust::raw_pointer_cast(impl->d_nodes.data()),
+			thrust::raw_pointer_cast(impl->d_objIDs.data()),
+			thrust::raw_pointer_cast(impl->d_objIDs.data()),
+			thrust::raw_pointer_cast(impl->d_objs),
 			numQuery, maxStackSize
 		);
 
 		checkCudaErrors(cudaGetLastError());
-		return std::min((size_t)d_flags[0], resSize);
+		return std::min((size_t)impl->d_flags[0], resSize);
 	}
 
 #pragma endregion
@@ -464,9 +478,9 @@ namespace Kitten {
 		printf("\nLBVH self check...\n");
 
 		// Get nodes
-		thrust::host_vector<node> nodes(d_nodes.begin(), d_nodes.end());
-		thrust::host_vector<uint32_t> morton(d_morton.begin(), d_morton.end());
-		thrust::host_vector<uint32_t> leafParent(d_leafParents.begin(), d_leafParents.end());
+		thrust::host_vector<node> nodes(impl->d_nodes.begin(), impl->d_nodes.end());
+		thrust::host_vector<uint32_t> morton(impl->d_morton.begin(), impl->d_morton.end());
+		thrust::host_vector<uint32_t> leafParent(impl->d_leafParents.begin(), impl->d_leafParents.end());
 
 		// Check sizes
 		if (nodes.size() != numObjs - 1 || morton.size() != numObjs)
