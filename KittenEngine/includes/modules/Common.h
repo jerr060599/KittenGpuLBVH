@@ -26,6 +26,7 @@ inline void gpuAssert(cudaError_t code, const char* file, int line, bool abort =
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/type_ptr.hpp>
 #include <glm/gtc/matrix_access.hpp>
+#define GLM_ENABLE_EXPERIMENTAL
 #include <glm/gtx/compatibility.hpp>
 #include <glm/gtx/norm.hpp>
 
